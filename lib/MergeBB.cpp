@@ -31,6 +31,13 @@
 //  introduced by DuplicateBB) will be updated, but not removed. Please keep
 //  this in mind when running the passes in a chain.
 //
+//  This example demonstrates:
+//  1. Advanced CFG analysis: finding identical blocks.
+//  2. Checking for instruction equivalence (`isSameOperationAs`).
+//  3. Safely removing basic blocks (`DeleteDeadBlock`).
+//  4. Updating branch instructions (terminators).
+//  5. Handling PHI nodes during block merging.
+//
 // USAGE:
 //    $ opt -load-pass-plugin <BUILD_DIR>/lib/libMergeBB.so `\`
 //      -passes=merge-bb -S <bitcode-file>
@@ -58,6 +65,9 @@ STATISTIC(OverallNumOfUpdatedBranchTargets, "Number of updated branch targets");
 //-----------------------------------------------------------------------------
 // MergeBB Implementation
 //-----------------------------------------------------------------------------
+// Checks if an instruction can be safely removed.
+// It must have exactly one use, which is either in the same block or a PHI node
+// in the successor block (which will be updated).
 bool MergeBB::canRemoveInst(const Instruction *Inst) {
   assert(Inst->hasOneUse() && "Inst needs to have exactly one use");
 
@@ -72,6 +82,10 @@ bool MergeBB::canRemoveInst(const Instruction *Inst) {
   return UsedInPhi || SameParentBB;
 }
 
+// Checks if two instructions are identical and can be merged.
+// 1. Same operation (opcode, type).
+// 2. Same operands.
+// 3. Can be safely removed (if they have uses).
 bool MergeBB::canMergeInstructions(ArrayRef<Instruction *> Insts) {
   const Instruction *Inst1 = Insts[0];
   const Instruction *Inst2 = Insts[1];
@@ -115,6 +129,7 @@ static unsigned getNumNonDbgInstrInBB(BasicBlock *BB) {
   return Count;
 }
 
+// Re-points edges from BBToErase to BBToRetain.
 unsigned MergeBB::updateBranchTargets(BasicBlock *BBToErase, BasicBlock *BBToRetain) {
   SmallVector<BasicBlock *, 8> BBToUpdate(predecessors(BBToErase));
 
@@ -140,6 +155,7 @@ unsigned MergeBB::updateBranchTargets(BasicBlock *BBToErase, BasicBlock *BBToRet
   return UpdatedTargetsCount;
 }
 
+// Tries to merge a basic block BB1 with any of its siblings (other predecessors of the same successor).
 bool MergeBB::mergeDuplicatedBlock(BasicBlock *BB1,
                                    SmallPtrSet<BasicBlock *, 8> &DeleteList) {
   // Do not optimize the entry block
@@ -160,6 +176,7 @@ bool MergeBB::mergeDuplicatedBlock(BasicBlock *BB1,
 
   BasicBlock *BBSucc = BB1Term->getSuccessor(0);
 
+  // Check the first instruction of the successor.
   BasicBlock::iterator II = BBSucc->begin();
   const PHINode *PN = dyn_cast<PHINode>(II);
   Value *InValBB1 = nullptr;
@@ -176,6 +193,8 @@ bool MergeBB::mergeDuplicatedBlock(BasicBlock *BB1,
   }
 
   unsigned BB1NumInst = getNumNonDbgInstrInBB(BB1);
+
+  // Iterate over other predecessors of the same successor to find a match.
   for (auto *BB2 : predecessors(BBSucc)) {
     // Do not optimize the entry block
     if (BB2 == &BB2->getParent()->getEntryBlock())
@@ -208,7 +227,6 @@ bool MergeBB::mergeDuplicatedBlock(BasicBlock *BB1,
 
     // Control flow can be merged if incoming values to the PHI node
     // at the successor are same values or both defined in the BBs to merge.
-    // For the latter case, canMergeInstructions executes further analysis.
     if (nullptr != PN) {
       Value *InValBB2 = PN->getIncomingValueForBlock(BB2);
       Instruction *InInstBB2 = dyn_cast<Instruction>(InValBB2);
@@ -221,7 +239,8 @@ bool MergeBB::mergeDuplicatedBlock(BasicBlock *BB1,
         continue;
     }
 
-    // Finally, check that all instructions in BB1 and BB2 are identical
+    // Finally, check that all instructions in BB1 and BB2 are identical.
+    // LockstepReverseIterator walks backwards from the end of both blocks.
     LockstepReverseIterator LRI(BB1, BB2);
     while (LRI.isValid() && canMergeInstructions(*LRI)) {
       --LRI;
@@ -232,9 +251,12 @@ bool MergeBB::mergeDuplicatedBlock(BasicBlock *BB1,
       continue;
 
     // It is safe to de-duplicate - do so.
+    // We update all predecessors of BB1 to jump to BB2 instead.
     unsigned UpdatedTargets = updateBranchTargets(BB1, BB2);
     assert(UpdatedTargets && "No branch target was updated");
     OverallNumOfUpdatedBranchTargets += UpdatedTargets;
+
+    // Mark BB1 for deletion.
     DeleteList.insert(BB1);
     NumDedupBBs++;
 
@@ -248,10 +270,13 @@ PreservedAnalyses MergeBB::run(llvm::Function &Func,
                                llvm::FunctionAnalysisManager &) {
   bool Changed = false;
   SmallPtrSet<BasicBlock *, 8> DeleteList;
+
+  // Try to merge every block in the function.
   for (auto &BB : Func) {
     Changed |= mergeDuplicatedBlock(&BB, DeleteList);
   }
 
+  // Delete the blocks that were merged.
   for (BasicBlock *BB : DeleteList) {
     DeleteDeadBlock(BB);
   }

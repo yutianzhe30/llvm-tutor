@@ -8,6 +8,12 @@
 //      a + b == (((a ^ b) + 2 * (a & b)) * 39 + 23) * 151 + 111
 //    See formula (3) in [1].
 //
+//    This example demonstrates:
+//    1. Complex instruction replacement.
+//    2. Filtering instructions based on bit width (8-bit only).
+//    3. Creating Constants (`ConstantInt`).
+//    4. Building a complex expression tree using `IRBuilder`.
+//
 // USAGE:
 //      $ opt -load-pass-plugin <BUILD_DIR>/lib/libMBAAdd.so `\`
 //        -passes=-"mba-add" <bitcode-file>
@@ -55,6 +61,7 @@ bool MBAAdd::runOnBasicBlock(BasicBlock &BB) {
 
     // Skip if the result is not 8-bit wide (this implies that the operands are
     // also 8-bit wide)
+    // We check `getIntegerBitWidth() == 8`.
     if (!BinOp->getType()->isIntegerTy() ||
         !(BinOp->getType()->getIntegerBitWidth() == 8))
       continue;
@@ -63,7 +70,8 @@ bool MBAAdd::runOnBasicBlock(BasicBlock &BB) {
     // them into basic blocks
     IRBuilder<> Builder(BinOp);
 
-    // Constants used in building the instruction for substitution
+    // Constants used in building the instruction for substitution.
+    // We need to create ConstantInt objects with the correct type (i8).
     auto Val39 = ConstantInt::get(BinOp->getType(), 39);
     auto Val151 = ConstantInt::get(BinOp->getType(), 151);
     auto Val23 = ConstantInt::get(BinOp->getType(), 23);
@@ -72,6 +80,8 @@ bool MBAAdd::runOnBasicBlock(BasicBlock &BB) {
 
     // Build an instruction representing `(((a ^ b) + 2 * (a & b)) * 39 + 23) *
     // 151 + 111`
+    // This is a polynomial based MBA identity.
+    // Notice how we nest `Builder.Create...` calls to build the expression tree.
     Instruction *NewInst =
         // E = e5 + 111
         BinaryOperator::CreateAdd(
@@ -105,6 +115,7 @@ bool MBAAdd::runOnBasicBlock(BasicBlock &BB) {
 
     // Replace `(a + b)` (original instructions) with `(((a ^ b) + 2 * (a & b))
     // * 39 + 23) * 151 + 111` (the new instruction)
+    // ReplaceInstWithInst updates the iterator 'Inst' to point to the new instruction.
     ReplaceInstWithInst(&BB, Inst, NewInst);
     Changed = true;
 
