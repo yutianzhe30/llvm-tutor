@@ -7,11 +7,15 @@
 //    to convert all equality-based floating point comparison instructions in a
 //    function to indirect, difference-based comparisons.
 //
-//    This example demonstrates how to couple an analysis pass with a
-//    transformation pass, the use of statistics (the STATISTIC macro), and LLVM
-//    debugging operations (the LLVM_DEBUG macro and the llvm::dbgs() output
-//    stream). It also demonstrates how instructions can be modified without
-//    having to completely replace them.
+//    This pass replaces direct equality checks (a == b) with an epsilon-based
+//    check (|a - b| < epsilon).
+//
+//    This example demonstrates:
+//    1. How to use an Analysis Pass (FindFCmpEq) within a Transformation Pass.
+//    2. How to create new instructions (FSub, BitCast, And, etc.) using IRBuilder.
+//    3. How to modify existing instructions in place (setPredicate, setOperand).
+//    4. Using Statistics to track pass activity.
+//    5. Dealing with floating point constants and types (APInt, APFloat).
 //
 //    Originally developed for [1].
 //
@@ -46,20 +50,21 @@
 
 using namespace llvm;
 
-// Unnamed namespace for private functions
+// Helper function to perform the conversion on a single instruction.
 static FCmpInst *convertFCmpEqInstruction(FCmpInst *FCmp) noexcept {
   assert(FCmp && "The given fcmp instruction is null");
 
   if (!FCmp->isEquality()) {
-    // We're only interested in equality-based comparisons, so return null if
-    // this comparison isn't equality-based.
+    // We're only interested in equality-based comparisons.
     return nullptr;
   }
 
   Value *LHS = FCmp->getOperand(0);
   Value *RHS = FCmp->getOperand(1);
-  // Determine the new floating-point comparison predicate based on the current
-  // one.
+
+  // Determine the new floating-point comparison predicate based on the current one.
+  // Equality (OEQ/UEQ) becomes Less Than (OLT/ULT) because we check if difference is smaller than epsilon.
+  // Inequality (ONE/UNE) becomes Greater/Equal (OGE/UGE).
   CmpInst::Predicate CmpPred = [FCmp] {
     switch (FCmp->getPredicate()) {
     case CmpInst::Predicate::FCMP_OEQ:
@@ -83,33 +88,41 @@ static FCmpInst *convertFCmpEqInstruction(FCmpInst *FCmp) noexcept {
   IntegerType *I64Ty = IntegerType::get(Ctx, 64);
   Type *DoubleTy = Type::getDoubleTy(Ctx);
 
-  // Define the sign-mask and double-precision machine epsilon constants.
+  // Define the sign-mask to compute absolute value using bitwise AND.
+  // (Assuming IEEE 754, the sign bit is the most significant bit).
   ConstantInt *SignMask = ConstantInt::get(I64Ty, ~(1L << 63));
-  // The machine epsilon value for IEEE 754 double-precision values is 2 ^ -52
-  // or (b / 2) * b ^ -(p - 1) where b (base) = 2 and p (precision) = 53.
+
+  // The machine epsilon value for IEEE 754 double-precision values.
+  // This serves as our threshold.
   APInt EpsilonBits(64, 0x3CB0000000000000);
   Constant *EpsilonValue =
       ConstantFP::get(DoubleTy, EpsilonBits.bitsToDouble());
 
-  // Create an IRBuilder with an insertion point set to the given fcmp
-  // instruction.
+  // Create an IRBuilder with an insertion point set to the given fcmp instruction.
+  // This means new instructions will be inserted *before* the FCmp instruction.
   IRBuilder<> Builder(FCmp);
-  // Create the subtraction, casting, absolute value, and new comparison
-  // instructions one at a time.
-  // %0 = fsub double %a, %b
+
+  // 1. Calculate the difference: %0 = fsub double %a, %b
   auto *FSubInst = Builder.CreateFSub(LHS, RHS);
-  // %1 = bitcast double %0 to i64
+
+  // 2. Calculate absolute value of the difference.
+  //    Since we don't have a direct 'fabs' instruction in LLVM IR (it's an intrinsic),
+  //    we can do it via bit manipulation for floating point numbers.
+  //    %1 = bitcast double %0 to i64
   auto *CastToI64 = Builder.CreateBitCast(FSubInst, I64Ty);
-  // %2 = and i64 %1, 0x7fffffffffffffff
+  //    %2 = and i64 %1, 0x7fffffffffffffff (clear sign bit)
   auto *AbsValue = Builder.CreateAnd(CastToI64, SignMask);
-  // %3 = bitcast i64 %2 to double
+  //    %3 = bitcast i64 %2 to double
   auto *CastToDouble = Builder.CreateBitCast(AbsValue, DoubleTy);
-  // %4 = fcmp <olt/ult/oge/uge> double %3, 0x3cb0000000000000
-  // Rather than creating a new instruction, we'll just change the predicate and
-  // operands of the existing fcmp instruction to match what we want.
+
+  // 3. Compare with Epsilon.
+  //    %4 = fcmp <olt/ult/oge/uge> double %3, Epsilon
+  // Rather than creating a new instruction and replacing usages, we reuse the existing FCmp instruction.
+  // We update its predicate and operands.
   FCmp->setPredicate(CmpPred);
   FCmp->setOperand(0, CastToDouble);
   FCmp->setOperand(1, EpsilonValue);
+
   return FCmp;
 }
 
@@ -125,21 +138,26 @@ STATISTIC(FCmpEqConversionCount,
 //------------------------------------------------------------------------------
 PreservedAnalyses ConvertFCmpEq::run(Function &Func,
                                      FunctionAnalysisManager &FAM) {
+  // Request the results of FindFCmpEq analysis.
   auto &Comparisons = FAM.getResult<FindFCmpEq>(Func);
+
+  // Run the transformation using the analysis results.
   bool Modified = run(Func, Comparisons);
+
+  // If we modified the function, we (conservatively) say we preserved no analyses.
   return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
 bool ConvertFCmpEq::run(Function &Func,
                         const FindFCmpEq::Result &Comparisons) {
   bool Modified = false;
-  // Functions marked explicitly 'optnone' should be ignored since we shouldn't
-  // be changing anything in them anyway.
+  // Functions marked explicitly 'optnone' should be ignored (e.g. clang -O0).
   if (Func.hasFnAttribute(Attribute::OptimizeNone)) {
     LLVM_DEBUG(dbgs() << "Ignoring optnone-marked function \"" << Func.getName()
                       << "\"\n");
     Modified = false;
   } else {
+    // Iterate over the list of instructions found by the analysis pass.
     for (FCmpInst *FCmp : Comparisons) {
       if (convertFCmpEqInstruction(FCmp)) {
         ++FCmpEqConversionCount;

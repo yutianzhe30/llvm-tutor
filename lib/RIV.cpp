@@ -7,6 +7,16 @@
 //    integer values reachable from that block. It uses the results of the
 //    DominatorTree pass.
 //
+//    Reachable Integer Values (RIV) for a Basic Block N are defined as:
+//    1. All integer values defined in Basic Blocks that dominate N.
+//    2. Input arguments of the function (if integer).
+//    3. Global variables (if integer).
+//
+//    This example demonstrates:
+//    1. How to use analysis results from other passes (DominatorTree).
+//    2. How to traverse the Control Flow Graph (CFG) using the Dominator Tree.
+//    3. Data flow analysis concepts.
+//
 // ALGORITHM:
 //    -------------------------------------------------------------------------
 //    v_N = set of integer values defined in basic block N (BB_N)
@@ -59,11 +69,12 @@ RIV::Result RIV::buildRIV(Function &F, NodeTy CFGRoot) {
   Result ResultMap;
 
   // Initialise a double-ended queue that will be used to traverse all BBs in F
+  // We use the Dominator Tree structure to traverse.
   std::deque<NodeTy> BBsToProcess;
   BBsToProcess.push_back(CFGRoot);
 
   // STEP 1: For every basic block BB compute the set of integer values defined
-  // in BB
+  // in BB. These are the values *produced* by instructions in that block.
   DefValMapTy DefinedValuesMap;
   for (BasicBlock &BB : F) {
     auto &Values = DefinedValuesMap[&BB];
@@ -73,18 +84,25 @@ RIV::Result RIV::buildRIV(Function &F, NodeTy CFGRoot) {
   }
 
   // STEP 2: Compute the RIVs for the entry BB. This will include global
-  // variables and input arguments.
+  // variables and input arguments, as they are visible everywhere.
   auto &EntryBBValues = ResultMap[&F.getEntryBlock()];
 
+  // Global variables are visible in all functions.
   for (auto &Global : F.getParent()->globals())
     if (Global.getValueType()->isIntegerTy())
       EntryBBValues.insert(&Global);
 
+  // Function arguments are visible throughout the function.
   for (Argument &Arg : F.args())
     if (Arg.getType()->isIntegerTy())
       EntryBBValues.insert(&Arg);
 
-  // STEP 3: Traverse the CFG for every BB in F calculate its RIVs
+  // STEP 3: Traverse the CFG for every BB in F calculate its RIVs.
+  // We traverse using the Dominator Tree. If A dominates B, then everything
+  // visible in A (plus what A defines) is visible in B.
+  // NOTE: This simple definition holds because we are using Dominator Tree traversal.
+  // If we were using CFG traversal, we would have to handle merge points (PHI nodes) differently.
+  // But since we follow the Dominator Tree, we know that Parent is the immediate dominator of Child.
   while (!BBsToProcess.empty()) {
     auto *Parent = BBsToProcess.back();
     BBsToProcess.pop_back();
@@ -103,6 +121,8 @@ RIV::Result RIV::buildRIV(Function &F, NodeTy CFGRoot) {
       BBsToProcess.push_back(Child);
       auto ChildBB = Child->getBlock();
 
+      // RIV(Child) = RIV(Parent) U Defined(Parent)
+
       // Add values defined in Parent to the current child's set of RIV
       ResultMap[ChildBB].insert(ParentDefs.begin(), ParentDefs.end());
 
@@ -115,7 +135,12 @@ RIV::Result RIV::buildRIV(Function &F, NodeTy CFGRoot) {
 }
 
 RIV::Result RIV::run(llvm::Function &F, llvm::FunctionAnalysisManager &FAM) {
+  // Request the DominatorTreeAnalysis result.
+  // This is a crucial step: FAM runs the required analysis (if not already cached)
+  // and returns the result.
   DominatorTree *DT = &FAM.getResult<DominatorTreeAnalysis>(F);
+
+  // Start the RIV computation starting from the root of the Dominator Tree.
   Result Res = buildRIV(F, DT->getRootNode());
 
   return Res;
@@ -124,6 +149,7 @@ RIV::Result RIV::run(llvm::Function &F, llvm::FunctionAnalysisManager &FAM) {
 PreservedAnalyses RIVPrinter::run(Function &Func,
                                   FunctionAnalysisManager &FAM) {
 
+  // Request the result of RIV.
   auto RIVMap = FAM.getResult<RIV>(Func);
 
   printRIVResult(OS, RIVMap);

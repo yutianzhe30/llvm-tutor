@@ -6,9 +6,11 @@
 //    Visits all instructions in a function and counts how many times every
 //    LLVM IR opcode was used. Prints the output to stderr.
 //
-//    This example demonstrates how to insert your pass at one of the
-//    predefined extension points, e.g. whenever the vectoriser is run (i.e. via
-//    `registerVectorizerStartEPCallback` for the new PM).
+//    This example demonstrates:
+//    1. How to create an Analysis Pass (as opposed to a Transformation Pass).
+//    2. How to traverse instructions within a function.
+//    3. How to register a pass to run automatically in an existing pipeline.
+//    4. The separation between the Analysis pass (logic) and the Printer pass (output).
 //
 // USAGE:
 //    1. New PM
@@ -29,19 +31,28 @@
 using namespace llvm;
 
 // Pretty-prints the result of this analysis
+// defined at the end of this file.
 static void printOpcodeCounterResult(llvm::raw_ostream &,
-                              const ResultOpcodeCounter &OC);
+                                     const ResultOpcodeCounter &OC);
 
 //-----------------------------------------------------------------------------
 // OpcodeCounter implementation
 //-----------------------------------------------------------------------------
+// The AnalysisKey is a special type used by the Analysis Manager to identify
+// this specific analysis pass. It's address is used as the unique identifier.
 llvm::AnalysisKey OpcodeCounter::Key;
 
+// This method implements the core logic of the analysis.
+// It iterates over all blocks and instructions to count opcode usage.
 OpcodeCounter::Result OpcodeCounter::generateOpcodeMap(llvm::Function &Func) {
   OpcodeCounter::Result OpcodeMap;
 
+  // Iterate over all Basic Blocks in the Function
   for (auto &BB : Func) {
+    // Iterate over all Instructions in the Basic Block
     for (auto &Inst : BB) {
+      // 'getOpcodeName()' returns the string representation of the opcode
+      // (e.g., "add", "sub", "br", "call").
       StringRef Name = Inst.getOpcodeName();
 
       if (OpcodeMap.find(Name) == OpcodeMap.end()) {
@@ -55,22 +66,32 @@ OpcodeCounter::Result OpcodeCounter::generateOpcodeMap(llvm::Function &Func) {
   return OpcodeMap;
 }
 
+// The 'run' method for an Analysis Pass returns the Result of the analysis.
+// This result is cached by the Analysis Manager and can be queried by other passes.
 OpcodeCounter::Result OpcodeCounter::run(llvm::Function &Func,
                                          llvm::FunctionAnalysisManager &) {
   return generateOpcodeMap(Func);
 }
 
+//-----------------------------------------------------------------------------
+// OpcodeCounterPrinter implementation
+//-----------------------------------------------------------------------------
+// This is a separate pass whose sole purpose is to request the results of
+// OpcodeCounter and print them. This separation of concerns is standard in LLVM.
 PreservedAnalyses OpcodeCounterPrinter::run(Function &Func,
                                             FunctionAnalysisManager &FAM) {
+  // Request the result of the OpcodeCounter analysis for the current function.
+  // If the analysis hasn't been run yet, the AM will run it.
+  // If it has been run and is still valid, the AM will return the cached result.
   auto &OpcodeMap = FAM.getResult<OpcodeCounter>(Func);
 
-  // In the legacy PM, the following string is printed automatically by the
-  // pass manager. For the sake of consistency, we're adding this here so that
-  // it's also printed when using the new PM.
+  // Use the output stream (OS) provided in the constructor (usually errs())
   OS << "Printing analysis 'OpcodeCounter Pass' for function '"
      << Func.getName() << "':\n";
 
   printOpcodeCounterResult(OS, OpcodeMap);
+
+  // This pass only prints output and doesn't modify the IR, so we preserve all analyses.
   return PreservedAnalyses::all();
 }
 
@@ -136,6 +157,7 @@ static void printOpcodeCounterResult(raw_ostream &OutS,
   OutS << "-------------------------------------------------"
                << "\n";
   for (auto &Inst : OpcodeMap) {
+    // Inst.first() is the key (StringRef), Inst.second is the value (unsigned)
     OutS << format("%-20s %-10lu\n", Inst.first().str().c_str(),
                            Inst.second);
   }

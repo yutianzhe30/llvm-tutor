@@ -64,6 +64,13 @@
 //      (...)                                  (...)                           V
 //    --------------------------------------------------------------------------
 //
+//    This example demonstrates:
+//    1. How to modify the Control Flow Graph (CFG).
+//    2. How to use `SplitBlockAndInsertIfThenElse`.
+//    3. How to clone instructions and basic blocks.
+//    4. How to update PHI nodes when merging control flow.
+//    5. How to use `ValueMap` to remap operands in cloned instructions.
+//
 //  USAGE:
 //      $ opt -load-pass-plugin <BUILD_DIR>/lib//libRIV.so `\`
 //      -load-pass-plugin <BUILD_DIR>/lib//libDuplicateBB.so `\`
@@ -142,20 +149,25 @@ DuplicateBB::findBBsToDuplicate(Function &F, const RIV::Result &RIVResult) {
 
 void DuplicateBB::cloneBB(BasicBlock &BB, Value *ContextValue,
                           ValueToPhiMap &ReMapper) {
-  // Don't duplicate Phi nodes - start right after them
+  // Don't duplicate Phi nodes - start right after them.
+  // PHI nodes must be at the top of the block, so we will handle them separately.
   BasicBlock::iterator BBHead = BB.getFirstNonPHIIt();
 
-  // Create the condition for 'if-then-else'
+  // Create the condition for 'if-then-else'.
+  // We use IsNull to create a boolean condition from the ContextValue.
   IRBuilder<> Builder(&*BBHead);
   Value *Cond = Builder.CreateIsNull(
       ReMapper.count(ContextValue) ? ReMapper[ContextValue] : ContextValue);
 
-  // Create and insert the 'if-else' blocks. At this point both blocks are
-  // trivial and contain only one terminator instruction branching to BB's
-  // tail, which contains all the instructions from BBHead onwards.
+  // Create and insert the 'if-else' blocks.
+  // This utility function splits the block at `BBHead`, inserting a new block
+  // with a conditional branch to two new empty blocks (ThenTerm and ElseTerm),
+  // which then branch to the original tail of the block.
   Instruction *ThenTerm = nullptr;
   Instruction *ElseTerm = nullptr;
   SplitBlockAndInsertIfThenElse(Cond, &*BBHead, &ThenTerm, &ElseTerm);
+
+  // 'Tail' is the part of the original block that was split off.
   BasicBlock *Tail = ThenTerm->getSuccessor(0);
 
   assert(Tail == ElseTerm->getSuccessor(0) && "Inconsistent CFG");
@@ -169,17 +181,16 @@ void DuplicateBB::cloneBB(BasicBlock &BB, Value *ContextValue,
   ThenTerm->getParent()->getSinglePredecessor()->setName("lt-if-then-else-" +
                                                          DuplicatedBBId);
 
-  // Variables to keep track of the new bindings
+  // Variables to keep track of the new bindings.
+  // ValueToValueMapTy maps original Values to their cloned counterparts.
   ValueToValueMapTy TailVMap, ThenVMap, ElseVMap;
 
   // The list of instructions in Tail that don't produce any values and thus
-  // can be removed
+  // can be removed (because we will clone them into Then/Else blocks).
   SmallVector<Instruction *, 8> ToRemove;
 
-  // Iterate through the original basic block and clone every instruction into
-  // the 'if-then' and 'else' branches. Update the bindings/uses on the fly
-  // (through ThenVMap, ElseVMap, TailVMap). At this stage, all instructions
-  // apart from PHI nodes, are stored in Tail.
+  // Iterate through the original basic block (now the Tail) and clone every instruction into
+  // the 'if-then' and 'else' branches.
   for (auto IIT = Tail->begin(), IE = Tail->end(); IIT != IE; ++IIT) {
     Instruction &Instr = *IIT;
     assert(!isa<PHINode>(&Instr) && "Phi nodes have already been filtered out");
@@ -195,26 +206,27 @@ void DuplicateBB::cloneBB(BasicBlock &BB, Value *ContextValue,
     Instruction *ThenClone = Instr.clone(), *ElseClone = Instr.clone();
 
     // Operands of ThenClone still hold references to the original BB.
-    // Update/remap them.
+    // Update/remap them to use values available in the Then block.
     RemapInstruction(ThenClone, ThenVMap, RF_IgnoreMissingLocals);
     ThenClone->insertBefore(ThenTerm->getIterator());
     ThenVMap[&Instr] = ThenClone;
 
     // Operands of ElseClone still hold references to the original BB.
-    // Update/remap them.
+    // Update/remap them to use values available in the Else block.
     RemapInstruction(ElseClone, ElseVMap, RF_IgnoreMissingLocals);
     ElseClone->insertBefore(ElseTerm->getIterator());
     ElseVMap[&Instr] = ElseClone;
 
-    // Instructions that don't produce values can be safely removed from Tail
+    // Instructions that don't produce values (e.g., void calls, stores) can be safely removed from Tail
+    // because they are now executed in both branches.
     if (ThenClone->getType()->isVoidTy()) {
       ToRemove.push_back(&Instr);
       continue;
     }
 
     // Instruction that produce a value should not require a slot in the
-    // TAIL *but* they can be used from the context, so just always
-    // generate a PHI, and let further optimization do the cleaning
+    // TAIL *but* they can be used from the context (e.g., by other blocks), so just always
+    // generate a PHI node in the Tail to merge the values from Then and Else.
     PHINode *Phi = PHINode::Create(ThenClone->getType(), 2);
     Phi->addIncoming(ThenClone, ThenTerm->getParent());
     Phi->addIncoming(ElseClone, ElseTerm->getParent());
@@ -222,12 +234,11 @@ void DuplicateBB::cloneBB(BasicBlock &BB, Value *ContextValue,
 
     ReMapper[&Instr] = Phi;
 
-    // Instructions are modified as we go, use the iterator version of
-    // ReplaceInstWithInst.
+    // Replace the original instruction in Tail with the new PHI node.
     ReplaceInstWithInst(Tail, IIT, Phi);
   }
 
-  // Purge instructions that don't produce any value
+  // Purge instructions that don't produce any value from Tail.
   for (auto *I : ToRemove)
     I->eraseFromParent();
 
@@ -239,13 +250,14 @@ PreservedAnalyses DuplicateBB::run(llvm::Function &F,
   if (!pRNG)
     pRNG = F.getParent()->createRNG("duplicate-bb");
   
+  // Use RIV analysis to find valid blocks to duplicate.
   BBToSingleRIVMap Targets = findBBsToDuplicate(F, FAM.getResult<RIV>(F));
 
   // This map is used to keep track of the new bindings. Otherwise, the
   // information from RIV will become obsolete.
   ValueToPhiMap ReMapper;
 
-  // Duplicate
+  // Duplicate each target block.
   for (auto &BB_Ctx : Targets) {
     cloneBB(*std::get<0>(BB_Ctx), std::get<1>(BB_Ctx), ReMapper);
   }

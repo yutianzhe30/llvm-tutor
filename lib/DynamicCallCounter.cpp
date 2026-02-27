@@ -36,6 +36,11 @@
 //    module. Functions that are only _declared_ (and defined elsewhere) are not
 //    counted.
 //
+//    This example demonstrates:
+//    1. Advanced IR modification: creating global variables, inserting loads/stores/adds.
+//    2. Creating a new function from scratch (`printf_wrapper`) and injecting it.
+//    3. Using `appendToGlobalDtors` to run code at program exit.
+//
 // USAGE:
 //      $ opt -load-pass-plugin <BUILD_DIR>/lib/libDynamicCallCounter.so `\`
 //        -passes=-"dynamic-cc" <bitcode-file> -o instrumentend.bin
@@ -54,10 +59,11 @@ using namespace llvm;
 
 #define DEBUG_TYPE "dynamic-cc"
 
+// Helper function to create a global integer variable initialized to 0.
 Constant *CreateGlobalCounter(Module &M, StringRef GlobalVarName) {
   auto &CTX = M.getContext();
 
-  // This will insert a declaration into M
+  // This will insert a declaration into M if it doesn't exist.
   Constant *NewGlobalVar =
       M.getOrInsertGlobal(GlobalVarName, IntegerType::getInt32Ty(CTX));
 
@@ -86,25 +92,28 @@ bool DynamicCallCounter::runOnModule(Module &M) {
   // STEP 1: For each function in the module, inject a call-counting code
   // --------------------------------------------------------------------
   for (auto &F : M) {
+    // We only instrument functions defined in this module (those with a body).
     if (F.isDeclaration())
       continue;
 
-    // Get an IR builder. Sets the insertion point to the top of the function
+    // Get an IR builder. Sets the insertion point to the top of the function.
     IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
 
-    // Create a global variable to count the calls to this function
+    // Create a global variable to count the calls to this function.
     std::string CounterName = "CounterFor_" + std::string(F.getName());
     Constant *Var = CreateGlobalCounter(M, CounterName);
     CallCounterMap[F.getName()] = Var;
 
-    // Create a global variable to hold the name of this function
+    // Create a global variable to hold the name of this function (for printing later).
     auto FuncName = Builder.CreateGlobalString(F.getName());
     FuncNameMap[F.getName()] = FuncName;
 
-    // Inject instruction to increment the call count each time this function
-    // executes
+    // Inject instruction to increment the call count each time this function executes.
+    // 1. Load the current value of the counter.
     LoadInst *Load2 = Builder.CreateLoad(IntegerType::getInt32Ty(CTX), Var);
+    // 2. Add 1 to the loaded value.
     Value *Inc2 = Builder.CreateAdd(Builder.getInt32(1), Load2);
+    // 3. Store the new value back to the global variable.
     Builder.CreateStore(Inc2, Var);
 
     // The following is visible only if you pass -debug on the command line
@@ -116,16 +125,14 @@ bool DynamicCallCounter::runOnModule(Module &M) {
 
   // Stop here if there are no function definitions in this module
   if (false == Instrumented)
-    return Instrumented;
+    return false;
 
   // STEP 2: Inject the declaration of printf
   // ----------------------------------------
   // Create (or _get_ in cases where it's already available) the following
   // declaration in the IR module:
   //    declare i32 @printf(i8*, ...)
-  // It corresponds to the following C declaration:
-  //    int printf(char *, ...)
-  PointerType *PrintfArgTy = PointerType::getUnqual(Type::getInt8Ty(CTX));
+  PointerType *PrintfArgTy = PointerType::getUnqual(CTX);
   FunctionType *PrintfTy =
       FunctionType::get(IntegerType::getInt32Ty(CTX), PrintfArgTy,
                         /*IsVarArgs=*/true);
@@ -134,19 +141,22 @@ bool DynamicCallCounter::runOnModule(Module &M) {
 
   // Set attributes as per inferLibFuncAttributes in BuildLibCalls.cpp
   Function *PrintfF = dyn_cast<Function>(Printf.getCallee());
-  PrintfF->setDoesNotThrow();
-  PrintfF->addParamAttr(0, llvm::Attribute::getWithCaptureInfo(
-                               M.getContext(), llvm::CaptureInfo::none()));
-  PrintfF->addParamAttr(0, Attribute::ReadOnly);
+  if (PrintfF) {
+    PrintfF->setDoesNotThrow();
+    PrintfF->addParamAttr(0, llvm::Attribute::getWithCaptureInfo(
+                                 M.getContext(), llvm::CaptureInfo::none()));
+    PrintfF->addParamAttr(0, Attribute::ReadOnly);
+  }
 
-  // STEP 3: Inject a global variable that will hold the printf format string
+  // STEP 3: Inject global variables that will hold the printf format strings
   // ------------------------------------------------------------------------
   llvm::Constant *ResultFormatStr =
       llvm::ConstantDataArray::getString(CTX, "%-20s %-10lu\n");
 
   Constant *ResultFormatStrVar =
       M.getOrInsertGlobal("ResultFormatStrIR", ResultFormatStr->getType());
-  dyn_cast<GlobalVariable>(ResultFormatStrVar)->setInitializer(ResultFormatStr);
+  if (auto *GV = dyn_cast<GlobalVariable>(ResultFormatStrVar))
+      GV->setInitializer(ResultFormatStr);
 
   std::string out = "";
   out += "=================================================\n";
@@ -160,7 +170,8 @@ bool DynamicCallCounter::runOnModule(Module &M) {
 
   Constant *ResultHeaderStrVar =
       M.getOrInsertGlobal("ResultHeaderStrIR", ResultHeaderStr->getType());
-  dyn_cast<GlobalVariable>(ResultHeaderStrVar)->setInitializer(ResultHeaderStr);
+  if (auto *GV = dyn_cast<GlobalVariable>(ResultHeaderStrVar))
+      GV->setInitializer(ResultHeaderStr);
 
   // STEP 4: Define a printf wrapper that will print the results
   // -----------------------------------------------------------
@@ -168,13 +179,11 @@ bool DynamicCallCounter::runOnModule(Module &M) {
   // and CallCounterMap.  It is equivalent to the following C++ function:
   // ```
   //    void printf_wrapper() {
+  //      printf(header);
   //      for (auto &item : Functions)
-  //        printf("llvm-tutor): Function %s was called %d times. \n",
-  //        item.name, item.count);
+  //        printf("%-20s %-10lu\n", item.name, item.count);
   //    }
   // ```
-  // (item.name comes from FuncNameMap, item.count comes from
-  // CallCounterMap)
   FunctionType *PrintfWrapperTy =
       FunctionType::get(llvm::Type::getVoidTy(CTX), {},
                         /*IsVarArgs=*/false);
@@ -187,18 +196,15 @@ bool DynamicCallCounter::runOnModule(Module &M) {
   IRBuilder<> Builder(RetBlock);
 
   // ... and start inserting calls to printf
-  // (printf requires i8*, so cast the input strings accordingly)
-  llvm::Value *ResultHeaderStrPtr =
-      Builder.CreatePointerCast(ResultHeaderStrVar, PrintfArgTy);
-  llvm::Value *ResultFormatStrPtr =
-      Builder.CreatePointerCast(ResultFormatStrVar, PrintfArgTy);
+  // In opaque pointers, we can use the global variables directly as pointers.
+  llvm::Value *ResultHeaderStrPtr = ResultHeaderStrVar;
+  llvm::Value *ResultFormatStrPtr = ResultFormatStrVar;
 
   Builder.CreateCall(Printf, {ResultHeaderStrPtr});
 
   LoadInst *LoadCounter;
   for (auto &item : CallCounterMap) {
     LoadCounter = Builder.CreateLoad(IntegerType::getInt32Ty(CTX), item.second);
-    // LoadCounter = Builder.CreateLoad(item.second);
     Builder.CreateCall(
         Printf, {ResultFormatStrPtr, FuncNameMap[item.first()], LoadCounter});
   }
@@ -208,6 +214,8 @@ bool DynamicCallCounter::runOnModule(Module &M) {
 
   // STEP 5: Call `printf_wrapper` at the very end of this module
   // ------------------------------------------------------------
+  // 'appendToGlobalDtors' adds the function to the list of destructors
+  // to be called when the program exits.
   appendToGlobalDtors(M, PrintfWrapperF, /*Priority=*/0);
 
   return true;
