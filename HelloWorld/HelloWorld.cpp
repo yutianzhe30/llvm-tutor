@@ -22,6 +22,7 @@
 // License: MIT
 //=============================================================================
 
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
@@ -43,6 +44,10 @@ void visitor(Function &F) {
 
     // 'F.arg_size()' returns the number of arguments the function takes.
     errs() << "(llvm-tutor)   number of arguments: " << F.arg_size() << "\n";
+    
+    auto returntype = F.getReturnType();
+    errs()<<"(llvm-tutor) func return type:"<<*returntype<<"\n";
+    
 }
 
 // New PM implementation
@@ -68,6 +73,39 @@ struct HelloWorld : PassInfoMixin<HelloWorld> {
   // all functions with optnone.
   static bool isRequired() { return true; }
 };
+
+struct LogReturn : PassInfoMixin<LogReturn> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+    if (F.getName() == "log_function_return") {
+        return PreservedAnalyses::all();
+    }
+
+    Module *M = F.getParent();
+    LLVMContext &Ctx = M->getContext();
+
+    FunctionType *LogFuncType = FunctionType::get(Type::getVoidTy(Ctx), {Type::getInt8Ty(Ctx)->getPointerTo()}, false);
+    FunctionCallee LogFunc = M->getOrInsertFunction("log_function_return", LogFuncType);
+    
+    std::string message = "Returning from " + std::string(F.getName());
+    Constant *MsgConstant = ConstantDataArray::getString(Ctx, message);
+    GlobalVariable *MsgGV = new GlobalVariable(*M, MsgConstant->getType(), true, GlobalValue::PrivateLinkage, MsgConstant, ".str");
+
+
+    for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+            if (isa<ReturnInst>(&I)) {
+                IRBuilder<> Builder(&I);
+                Value *MsgPtr = Builder.CreateInBoundsGEP(MsgGV->getValueType(), MsgGV, {Builder.getInt32(0), Builder.getInt32(0)});
+                Builder.CreateCall(LogFunc, {MsgPtr});
+            }
+        }
+    }
+    return PreservedAnalyses::none();
+  }
+
+  static bool isRequired() { return true; }
+};
+
 } // namespace
 
 //-----------------------------------------------------------------------------
@@ -86,6 +124,10 @@ llvm::PassPluginLibraryInfo getHelloWorldPluginInfo() {
                   if (Name == "hello-world") {
                     // Add our pass to the Function Pass Manager
                     FPM.addPass(HelloWorld());
+                    return true;
+                  }
+                  if (Name == "log-return") {
+                    FPM.addPass(LogReturn());
                     return true;
                   }
                   return false;
