@@ -33,7 +33,8 @@ using namespace llvm;
 // Pretty-prints the result of this analysis
 // defined at the end of this file.
 static void printOpcodeCounterResult(llvm::raw_ostream &,
-                                     const ResultOpcodeCounter &OC);
+                                     const ResultOpcodeCounter &OC
+                                    );
 
 //-----------------------------------------------------------------------------
 // OpcodeCounter implementation
@@ -46,7 +47,6 @@ llvm::AnalysisKey OpcodeCounter::Key;
 // It iterates over all blocks and instructions to count opcode usage.
 OpcodeCounter::Result OpcodeCounter::generateOpcodeMap(llvm::Function &Func) {
   OpcodeCounter::Result OpcodeMap;
-
   // Iterate over all Basic Blocks in the Function
   for (auto &BB : Func) {
     // Iterate over all Instructions in the Basic Block
@@ -54,11 +54,28 @@ OpcodeCounter::Result OpcodeCounter::generateOpcodeMap(llvm::Function &Func) {
       // 'getOpcodeName()' returns the string representation of the opcode
       // (e.g., "add", "sub", "br", "call").
       StringRef Name = Inst.getOpcodeName();
-
+       OpcodeMap["total"] ++;
+      if (Inst.isBinaryOp())
+        OpcodeMap["BinaryOp"]++;
       if (OpcodeMap.find(Name) == OpcodeMap.end()) {
         OpcodeMap[Inst.getOpcodeName()] = 1;
       } else {
         OpcodeMap[Inst.getOpcodeName()]++;
+      }
+      switch (Inst.getOpcode())
+      {
+      case Instruction::Load:
+        OpcodeMap["Load"]++;
+        break;
+      case Instruction::Store:
+        OpcodeMap["Store"]++;
+        break;
+      case Instruction::Alloca:
+        OpcodeMap["Alloca"]++;
+        break;
+
+      default:
+        break;
       }
     }
   }
