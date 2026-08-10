@@ -33,3 +33,8 @@ build/
 *.exe
 *.out
 *.app
+
+#llvm temp file
+*.bc
+*.ll
+*.bin

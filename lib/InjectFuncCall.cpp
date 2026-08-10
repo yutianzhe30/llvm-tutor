@@ -7,14 +7,15 @@
 //    a call to printf (from the C standard I/O library). The injected IR code
 //    corresponds to the following function call in ANSI C:
 //    ```C
-//      printf("(llvm-tutor) Hello from: %s\n(llvm-tutor)   number of arguments: %d\n",
+//      printf("(llvm-tutor) Hello from: %s\n(llvm-tutor)   number of arguments:
+//      %d\n",
 //             FuncName, FuncNumArgs);
 //    ```
 //    This code is inserted at the beginning of each function, i.e. before any
 //    other instruction is executed.
 //
-//    To illustrate, for `void foo(int a, int b, int c)`, the code added by InjectFuncCall
-//    will generated the following output at runtime:
+//    To illustrate, for `void foo(int a, int b, int c)`, the code added by
+//    InjectFuncCall will generated the following output at runtime:
 //    ```
 //    (llvm-tutor) Hello World from: foo
 //    (llvm-tutor)   number of arguments: 3
@@ -35,12 +36,49 @@
 #include "InjectFuncCall.h"
 
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "inject-func-call"
+
+// helper function loging return
+bool loggingReturn(FunctionCallee &Printf, Module &M) {
+  auto &CTX = M.getContext();
+  // We create a constant string literal for the format string.
+  llvm::Constant *HomeWorkFormatStr = llvm::ConstantDataArray::getString(
+      CTX,
+      "(llvm-tutor) Returning from: %s\n (llvm-tutor)  first arg if int: %d\n");
+
+  // Create a global variable in the module to hold this string.
+  Constant *PrintfFormatStrVar =
+      M.getOrInsertGlobal("HomeWorkFormatStr", HomeWorkFormatStr->getType());
+
+  // Initialize the global variable with the string data.
+  if (auto *GV = dyn_cast<GlobalVariable>(PrintfFormatStrVar)) {
+    GV->setInitializer(HomeWorkFormatStr);
+  }
+  for (auto &F : M) {
+    // Skip function declarations (functions without a body, e.g. external
+    // libraries)
+    if (F.isDeclaration())
+      continue;
+    Value *Arg0 = ConstantInt::get(Type::getInt32Ty(CTX), 0);
+    if (!F.arg_empty() && F.getArg(0)->getType()->isIntegerTy(32))
+      Arg0=F.getArg(0);
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (isa<ReturnInst>(&I)) {
+          IRBuilder<> Builder(&I);
+          auto FuncName = Builder.CreateGlobalString(F.getName());
+          Builder.CreateCall(Printf, {PrintfFormatStrVar, FuncName,Arg0});
+        }
+      }
+    }
+  }
+  return true;
+}
 
 //-----------------------------------------------------------------------------
 // InjectFuncCall implementation
@@ -50,38 +88,40 @@ bool InjectFuncCall::runOnModule(Module &M) {
 
   auto &CTX = M.getContext();
   // Get the pointer type for the current context.
-  // In opaque pointer mode (default in recent LLVM), all pointers are the same type.
+  // In opaque pointer mode (default in recent LLVM), all pointers are the same
+  // type.
   PointerType *PrintfArgTy = PointerType::getUnqual(CTX);
 
   // STEP 1: Inject the declaration of printf
   // ----------------------------------------
   // We need to tell LLVM about the 'printf' function so we can call it.
   // It corresponds to the C declaration: int printf(char *, ...)
-  FunctionType *PrintfTy = FunctionType::get(
-      IntegerType::getInt32Ty(CTX), // Return type: i32
-      PrintfArgTy,                  // First argument: char* (pointer)
-      /*IsVarArgs=*/true);          // Variadic arguments: ...
+  FunctionType *PrintfTy =
+      FunctionType::get(IntegerType::getInt32Ty(CTX), // Return type: i32
+                        PrintfArgTy,         // First argument: char* (pointer)
+                        /*IsVarArgs=*/true); // Variadic arguments: ...
 
   // 'getOrInsertFunction' will either return the existing function if it was
   // already declared, or create a new declaration.
   FunctionCallee Printf = M.getOrInsertFunction("printf", PrintfTy);
 
   // Set attributes for the printf function.
-  // 'dyn_cast' checks if the callee is indeed a Function (it could be something else if name collision).
+  // 'dyn_cast' checks if the callee is indeed a Function (it could be something
+  // else if name collision).
   Function *PrintfF = dyn_cast<Function>(Printf.getCallee());
   if (PrintfF) {
-      PrintfF->setDoesNotThrow(); // printf doesn't throw C++ exceptions
-      PrintfF->addParamAttr(0, llvm::Attribute::getWithCaptureInfo(
-                                   M.getContext(), llvm::CaptureInfo::none()));
-      PrintfF->addParamAttr(0, Attribute::ReadOnly); // First arg is read-only
+    PrintfF->setDoesNotThrow(); // printf doesn't throw C++ exceptions
+    PrintfF->addParamAttr(0, llvm::Attribute::getWithCaptureInfo(
+                                 M.getContext(), llvm::CaptureInfo::none()));
+    PrintfF->addParamAttr(0, Attribute::ReadOnly); // First arg is read-only
   }
-
 
   // STEP 2: Inject a global variable that will hold the printf format string
   // ------------------------------------------------------------------------
   // We create a constant string literal for the format string.
   llvm::Constant *PrintfFormatStr = llvm::ConstantDataArray::getString(
-      CTX, "(llvm-tutor) Hello from: %s\n(llvm-tutor)   number of arguments: %d\n");
+      CTX,
+      "(llvm-tutor) Hello from: %s\n(llvm-tutor)   number of arguments: %d\n");
 
   // Create a global variable in the module to hold this string.
   Constant *PrintfFormatStrVar =
@@ -89,13 +129,14 @@ bool InjectFuncCall::runOnModule(Module &M) {
 
   // Initialize the global variable with the string data.
   if (auto *GV = dyn_cast<GlobalVariable>(PrintfFormatStrVar)) {
-      GV->setInitializer(PrintfFormatStr);
+    GV->setInitializer(PrintfFormatStr);
   }
 
   // STEP 3: For each function in the module, inject a call to printf
   // ----------------------------------------------------------------
   for (auto &F : M) {
-    // Skip function declarations (functions without a body, e.g. external libraries)
+    // Skip function declarations (functions without a body, e.g. external
+    // libraries)
     if (F.isDeclaration())
       continue;
 
@@ -104,7 +145,8 @@ bool InjectFuncCall::runOnModule(Module &M) {
     IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
 
     // Create a global string variable for the function name.
-    // IRBuilder handles the details of creating the global variable and getting a pointer to it.
+    // IRBuilder handles the details of creating the global variable and getting
+    // a pointer to it.
     auto FuncName = Builder.CreateGlobalString(F.getName());
 
     // Prepare arguments for printf.
@@ -124,22 +166,22 @@ bool InjectFuncCall::runOnModule(Module &M) {
 
     InsertedAtLeastOnePrintf = true;
   }
-
+  loggingReturn(Printf, M);
   return InsertedAtLeastOnePrintf;
 }
 
 PreservedAnalyses InjectFuncCall::run(llvm::Module &M,
-                                       llvm::ModuleAnalysisManager &) {
+                                      llvm::ModuleAnalysisManager &) {
   // Delegate the work to a helper method.
-  bool Changed =  runOnModule(M);
+  bool Changed = runOnModule(M);
 
-  // If we modified the module, we must indicate that analyses are not preserved.
-  // (Or carefully specify which ones are preserved).
-  // 'PreservedAnalyses::none()' is the safest default for transformation passes.
+  // If we modified the module, we must indicate that analyses are not
+  // preserved. (Or carefully specify which ones are preserved).
+  // 'PreservedAnalyses::none()' is the safest default for transformation
+  // passes.
   return (Changed ? llvm::PreservedAnalyses::none()
                   : llvm::PreservedAnalyses::all());
 }
-
 
 //-----------------------------------------------------------------------------
 // New PM Registration
