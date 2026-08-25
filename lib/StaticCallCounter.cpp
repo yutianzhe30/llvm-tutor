@@ -14,7 +14,8 @@
 //    StaticCallCounter without `opt`.
 //
 //    This example demonstrates:
-//    1. How to iterate over all instructions in a Module (across all functions).
+//    1. How to iterate over all instructions in a Module (across all
+//    functions).
 //    2. How to identify Call instructions (`CallBase`).
 //    3. How to distinguish between Direct and Indirect calls.
 //    4. Using `MapVector` to store results deterministically.
@@ -32,10 +33,10 @@
 #include "llvm/Passes/PassPlugin.h"
 
 using namespace llvm;
-
+ResultCaller CallerResult;
 // Pretty-prints the result of this analysis
 static void printStaticCCResult(llvm::raw_ostream &OutS,
-                         const ResultStaticCC &DirectCalls);
+                                const ResultStaticCC &DirectCalls);
 
 //------------------------------------------------------------------------------
 // StaticCallCounter Implementation
@@ -43,34 +44,38 @@ static void printStaticCCResult(llvm::raw_ostream &OutS,
 // This method implements the core logic of the analysis.
 // It iterates over the entire module to count direct function calls.
 StaticCallCounter::Result StaticCallCounter::runOnModule(Module &M) {
-  // MapVector is used instead of std::map to ensure deterministic iteration order.
-  // Key: Pointer to the called function (const Function *)
-  // Value: Count of calls (unsigned)
+  // MapVector is used instead of std::map to ensure deterministic iteration
+  // order. Key: Pointer to the called function (const Function *) Value: Count
+  // of calls (unsigned)
   llvm::MapVector<const llvm::Function *, unsigned> Res;
 
   // Iterate over all Functions in the Module
   for (auto &Func : M) {
+    if (Func.isDeclaration())
+      continue;
     // Iterate over all BasicBlocks in the Function
     for (auto &BB : Func) {
       // Iterate over all Instructions in the BasicBlock
       for (auto &Ins : BB) {
 
         // Check if the instruction is a call instruction.
-        // `CallBase` is the base class for all call-like instructions (CallInst, InvokeInst, etc.)
-        // `dyn_cast` returns null if the cast fails.
+        // `CallBase` is the base class for all call-like instructions
+        // (CallInst, InvokeInst, etc.) `dyn_cast` returns null if the cast
+        // fails.
         auto *CB = dyn_cast<CallBase>(&Ins);
         if (nullptr == CB) {
           continue;
         }
 
         // Check if it is a direct function call.
-        // `getCalledFunction()` returns the Function object if it's a direct call,
-        // or nullptr if it's an indirect call (e.g., via function pointer).
+        // `getCalledFunction()` returns the Function object if it's a direct
+        // call, or nullptr if it's an indirect call (e.g., via function
+        // pointer).
         auto DirectInvoc = CB->getCalledFunction();
         if (nullptr == DirectInvoc) {
           continue;
         }
-
+        CallerResult[DirectInvoc].insert(&Func);
         // We have a direct function call - update the count for the function
         // being called.
         auto CallCount = Res.find(DirectInvoc);
@@ -87,9 +92,8 @@ StaticCallCounter::Result StaticCallCounter::runOnModule(Module &M) {
 
 // Printer Pass implementation.
 // Fetches the analysis result and prints it.
-PreservedAnalyses
-StaticCallCounterPrinter::run(Module &M,
-                              ModuleAnalysisManager &MAM) {
+PreservedAnalyses StaticCallCounterPrinter::run(Module &M,
+                                                ModuleAnalysisManager &MAM) {
 
   // Request the result of the StaticCallCounter analysis.
   // This triggers the analysis if it hasn't run yet.
@@ -156,7 +160,15 @@ static void printStaticCCResult(raw_ostream &OutS,
     OutS << format("%-20s %-10lu\n", CallCount.first->getName().str().c_str(),
                    CallCount.second);
   }
-
+  OutS << "------------CallerMaps\n";
+  for (auto &CallPair : CallerResult) {
+    OutS << format("Callee%-20s Called From\n",
+                   CallPair.first->getName().str().c_str());
+    for (auto &F : CallPair.second) {
+      OutS << format("%-20s ", F->getName().str().c_str());
+    }
+    OutS << "\n";
+  }
   OutS << "-------------------------------------------------"
        << "\n\n";
 }

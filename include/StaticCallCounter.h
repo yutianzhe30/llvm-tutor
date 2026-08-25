@@ -14,6 +14,7 @@
 #define LLVM_TUTOR_STATICCALLCOUNTER_H
 
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/IR/AbstractCallSite.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -24,6 +25,9 @@
 // New PM interface
 //------------------------------------------------------------------------------
 using ResultStaticCC = llvm::MapVector<const llvm::Function *, unsigned>;
+using ResultCaller = llvm::MapVector<
+      const llvm::Function *,
+      llvm::SetVector<const llvm::Function *>>;
 
 struct StaticCallCounter : public llvm::AnalysisInfoMixin<StaticCallCounter> {
   using Result = ResultStaticCC;
